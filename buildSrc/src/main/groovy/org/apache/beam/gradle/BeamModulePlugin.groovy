@@ -118,6 +118,15 @@ class BeamModulePlugin implements Plugin<Project> {
     /** Classes triggering Checker failures. A map from class name to the bug filed against checkerframework. */
     Map<String, String> classesTriggerCheckerBugs = [:]
 
+    /**
+     * Controls whether the Checker Framework is skipped for this project. This must be set here
+     * (rather than with a `checkerFramework { skipCheckerFramework = true }` block in the
+     * subproject's build.gradle) because the Checker Framework plugin locks in its skip decision
+     * for a JavaCompile task the first time that task is realized (created and configured), which
+     * happens inside applyJavaNature -- before the rest of the subproject's build.gradle runs.
+     */
+    boolean skipCheckerFramework = false
+
     /** Controls whether the dependency analysis plugin is enabled. */
     boolean enableStrictDependencies = true
 
@@ -614,7 +623,7 @@ class BeamModulePlugin implements Plugin<Project> {
     def aws_java_sdk2_version = "2.20.162"
     def cassandra_driver_version = "3.10.2"
     def cdap_version = "6.11.4"
-    def checkerframework_version = "3.42.0"
+    def checkerframework_version = "4.2.3"
     def classgraph_version = "4.8.192"
     def delta_lake_version = "4.2.0"
     def dbcp2_version = "2.9.0"
@@ -1056,11 +1065,6 @@ class BeamModulePlugin implements Plugin<Project> {
         // Disabling checks since this property is only used for tests
         options.errorprone.errorproneArgs.add("-XepDisableAllChecks")
         options.forkOptions.jvmArgs += errorProneAddModuleOpts.collect { '-J' + it }
-        // TODO(https://github.com/apache/beam/issues/28963)
-        // upgrade checkerFramework to enable it in Java 21+
-        project.checkerFramework {
-          skipCheckerFramework = true
-        }
       } else {
         throw new GradleException("Unknown Java Version ${ver} for setting additional java options")
       }
@@ -1318,9 +1322,25 @@ class BeamModulePlugin implements Plugin<Project> {
           'org.checkerframework.checker.nullness.NullnessChecker'
         ]
 
-        // Only skip checkerframework if explicitly requested
-        skipCheckerFramework = project.hasProperty('enableCheckerFramework') &&
-            !parseBooleanProperty(project, 'enableCheckerFramework')
+        version = checkerframework_version
+
+        // Only skip checkerframework if explicitly requested, via the
+        // `skipCheckerFramework` configuration option or the
+        // `enableCheckerFramework` project property. Always skip it for
+        // JMH benchmark modules: it's slow, and it often raises erroneous errors
+        // because we don't have checker annotations for generated code and test
+        // libraries. This must be decided here (rather than later, in the
+        // `enableJmh` block below) because the Checker Framework plugin locks in
+        // its skip decision for a JavaCompile task the first time that task is
+        // realized, which can happen as soon as `project.tasks.withType(JavaCompile) { ... }`
+        // runs further down in this method -- well before the `enableJmh` block.
+        // For the same reason, the skip for compilation forked to Java 17+ is decided here rather
+        // than in setJavaVerOptions.
+        skipCheckerFramework = configuration.skipCheckerFramework ||
+          (project.hasProperty('enableCheckerFramework') &&
+            !parseBooleanProperty(project, 'enableCheckerFramework')) ||
+            configuration.enableJmh ||
+            (forkJavaVersion?.isInteger() && forkJavaVersion.toInteger() >= 17)
 
         // Always exclude checkerframework on tests. It's slow, and it often
         // raises erroneous error because we don't have checker annotations for
@@ -1333,14 +1353,26 @@ class BeamModulePlugin implements Plugin<Project> {
           "-AskipDefs=${skipDefCombinedRegex}",
           "-AskipUses=${skipUsesCombinedRegex}",
           "-AnoWarnMemoryConstraints",
-          "-AsuppressWarnings=annotation.not.completed,keyfor",
+          // TODO: fix all the Nullness Checker warnings and re-enable.
+          // "-AsuppressWarnings=annotation.not.completed,keyfor",
+          "-AsuppressWarnings=allcheckers",
+          // The following line should only be used when testing the Checker Framework.
+          "-AconvertTypeArgInferenceCrashToWarning=false",
+          // TODO: Add the following
+          // "-ArequirePrefixInWarningSuppressions",
+          // "-AwarnRedundantAnnotations",
+          // "-AwarnUnneededSuppressions",
         ]
-
-        project.dependencies {
-          checkerFramework("org.checkerframework:checker:$checkerframework_version")
-        }
-        project.configurations.all {
-          it.exclude(group:"org.checkerframework", module:"jdk8")
+      }
+      // True if the Checker Framework plugin supplies a locally-built checker-qual.jar.
+      boolean cfLocal = project.findProperty('cfVersion') == 'local'
+      project.configurations.all {
+        it.exclude(group:"org.checkerframework", module:"jdk8")
+        // With -PcfVersion=local, exclude the Maven checker-qual, whether declared
+        // directly or pulled in transitively (e.g., by Guava), so that the classpath does not mix
+        // qualifiers from two versions.
+        if (cfLocal) {
+          it.exclude(group:"org.checkerframework", module:"checker-qual")
         }
       }
 
@@ -1496,7 +1528,9 @@ class BeamModulePlugin implements Plugin<Project> {
         // This contains many improved annotations beyond javax.annotations for enhanced static checking
         // of the codebase. It is runtime so users can also take advantage of them. The annotations themselves
         // are MIT licensed (checkerframework is GPL and cannot be distributed)
-        implementation "org.checkerframework:checker-qual:$checkerframework_version"
+        if (!cfLocal) {
+          implementation "org.checkerframework:checker-qual:$checkerframework_version"
+        }
       }
 
       // Defines Targets for sonarqube analysis reporting.
@@ -1873,18 +1907,6 @@ class BeamModulePlugin implements Plugin<Project> {
           runtimeOnly it.project(path: ":sdks:java:testing:test-utils")
           annotationProcessor "org.openjdk.jmh:jmh-generator-annprocess:$jmh_version"
           implementation project.library.java.jmh_core
-        }
-
-        project.compileJava {
-          // Always exclude checkerframework on JMH generated code. It's slow,
-          // and it often raises erroneous error because we don't have checker
-          // annotations for generated code and test libraries.
-          //
-          // Consider re-enabling if we can get annotations for the generated
-          // code and test libraries we use.
-          checkerFramework {
-            skipCheckerFramework = true
-          }
         }
 
         project.tasks.register("jmh", JavaExec)  {
